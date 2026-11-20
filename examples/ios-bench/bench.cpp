@@ -1,8 +1,9 @@
-// Metal vs CoreML benchmark: loads the model once, then generates 1 warm-up and up to 3 timed 512x512
+// ggml vs sidecar benchmark: loads the model once, then generates 1 warm-up and up to 3 timed 512x512
 // images (seed 42). Stage times come from sd.cpp's own log lines. Defaults fit SDXS (1 step, CFG 1).
-// usage: sd-bench bench <model.gguf> <unet.mlmodelc|-> <out_prefix> [tae_decoder.mlmodelc] [options]
-//   "-" runs the UNet with ggml (Metal); a .mlmodelc runs it with the CoreML sidecar. The optional
-//   tae_decoder.mlmodelc runs the tiny decoder with its CoreML sidecar too.
+// usage: sd-bench bench <model.gguf> <unet.mlmodelc|unet.bin|-> <out_prefix> [tae_decoder] [options]
+//   "-" runs the UNet with ggml (Metal on Apple, the CPU on Android); a .mlmodelc runs it with the CoreML
+//   sidecar, and a .bin (QNN context binary, examples/android-bench) with the QNN sidecar on the Hexagon NPU.
+//   The optional tae_decoder (.mlmodelc or .bin) runs the tiny decoder with its sidecar too.
 // options: --steps N  --cfg F  --sampler NAME  --taesd FILE (ggml TAESD, for models without a built-in
 //   tiny decoder such as SD 2.1)  --images N (timed images, 1-3)  --mmap (map the model file instead of
 //   reading it into memory; on iOS the mapped pages do not count against the app's memory limit)
@@ -44,6 +45,7 @@ void log_cb(enum sd_log_level_t level, const char* text, void*) {
     }
     static const bool verbose = getenv("SDBENCH_VERBOSE") != nullptr;
     if (verbose || level >= SD_LOG_WARN || strstr(text, "coreml unet") || strstr(text, "coreml tae") ||
+        strstr(text, "qnn unet") || strstr(text, "qnn tae") || strstr(text, "qnn: ") ||
         strstr(text, "total params memory")) {
         fputs(text, stdout);
     }
@@ -53,11 +55,11 @@ void log_cb(enum sd_log_level_t level, const char* text, void*) {
 
 int sd_bench_main(int argc, const char* argv[]) {
     if (argc < 5) {
-        fprintf(stderr, "usage: %s bench <model.gguf> <unet.mlmodelc|-> <out_prefix> [tae_decoder.mlmodelc]\n", argv[0]);
+        fprintf(stderr, "usage: %s bench <model.gguf> <unet.mlmodelc|unet.bin|-> <out_prefix> [tae_decoder]\n", argv[0]);
         return 1;
     }
     const char* model   = argv[2];
-    const char* coreml  = strcmp(argv[3], "-") == 0 ? "" : argv[3];
+    const char* unet    = strcmp(argv[3], "-") == 0 ? "" : argv[3];
     std::string prefix  = argv[4];
     const char* tae     = argc > 5 && strncmp(argv[5], "--", 2) != 0 ? argv[5] : "";
     int steps           = 1;
@@ -109,8 +111,21 @@ int sd_bench_main(int argc, const char* argv[]) {
     sd_ctx_params_t ctx_params;
     sd_ctx_params_init(&ctx_params);
     ctx_params.model_path              = model;
-    ctx_params.coreml_unet_path        = coreml;
-    ctx_params.coreml_tae_decoder_path = tae;
+    // A .bin is a QNN context binary (Hexagon NPU); anything else is a CoreML model.
+    auto is_qnn = [](const char* path) {
+        size_t n = strlen(path);
+        return n > 4 && strcmp(path + n - 4, ".bin") == 0;
+    };
+    if (is_qnn(unet)) {
+        ctx_params.qnn_unet_path = unet;
+    } else {
+        ctx_params.coreml_unet_path = unet;
+    }
+    if (is_qnn(tae)) {
+        ctx_params.qnn_tae_decoder_path = tae;
+    } else {
+        ctx_params.coreml_tae_decoder_path = tae;
+    }
     ctx_params.taesd_path              = taesd;
     ctx_params.enable_mmap             = mmap;
     if (*pred) {
@@ -125,8 +140,15 @@ int sd_bench_main(int argc, const char* argv[]) {
         fprintf(stdout, "[bench] new_sd_ctx failed\n");
         return 1;
     }
-    fprintf(stdout, "[bench] unet=%s decoder=%s steps=%d cfg=%.1f load=%.2f s\n", *coreml ? "coreml" : "metal",
-            *tae ? "coreml" : (*taesd ? "taesd-metal" : "metal"), steps, cfg, load_s);
+#ifdef __APPLE__
+    const char* ggml_name = "metal";
+#else
+    const char* ggml_name = "ggml";
+#endif
+    const std::string ggml_taesd = std::string("taesd-") + ggml_name;
+    fprintf(stdout, "[bench] unet=%s decoder=%s steps=%d cfg=%.1f load=%.2f s\n",
+            *unet ? (is_qnn(unet) ? "qnn" : "coreml") : ggml_name,
+            *tae ? (is_qnn(tae) ? "qnn" : "coreml") : (*taesd ? ggml_taesd.c_str() : ggml_name), steps, cfg, load_s);
 
     for (const auto& job : jobs) {
         sd_img_gen_params_t params;
