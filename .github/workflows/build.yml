@@ -323,6 +323,72 @@ jobs:
       - name: Converter parity tests
         run: venv/bin/python -m unittest script/coreml/test_convert_unet.py
 
+  ubuntu-qnn-tests:
+    # QAIRT's x86 tools and HTP simulator support Ubuntu 22.04 with Python 3.10.
+    runs-on: ubuntu-22.04
+    env:
+      QAIRT_VERSION: 2.40.0.251030
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: QAIRT SDK cache
+        id: qairt-cache
+        uses: actions/cache@v4
+        with:
+          path: qairt
+          key: qairt-${{ env.QAIRT_VERSION }}
+
+      - name: QAIRT SDK
+        if: steps.qairt-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -sSfL -o qairt.zip "https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_VERSION}/v${QAIRT_VERSION}.zip"
+          v=qairt/${QAIRT_VERSION}
+          unzip -q qairt.zip "$v/include/*" "$v/bin/*" "$v/lib/python/*" "$v/lib/x86_64-linux-clang/*" \
+                "$v/lib/aarch64-android/*" "$v/lib/hexagon-v79/*" "$v/share/*"
+          rm qairt.zip
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libc++1 libc++abi1 ninja-build
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Python dependencies
+        run: |
+          pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+          # What the QAIRT converters import (see $QNN_SDK_ROOT/bin/check-python-dependency).
+          pip install onnx==1.16.1 numpy==1.26.4 pyyaml packaging pandas protobuf==3.20.3 absl-py attrs decorator \
+                      invoke joblib jsonschema lxml mock scipy six tabulate typing-extensions xlsxwriter psutil
+
+      - name: Build (x86_64, HTP simulator)
+        run: |
+          export QNN_SDK_ROOT=$PWD/qairt/${QAIRT_VERSION}
+          cmake -B build -G Ninja -DSD_QNN=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target test-qnn sd-cli
+
+      - name: QNN sidecar tests
+        run: |
+          export QNN_SDK_ROOT=$PWD/qairt/${QAIRT_VERSION}
+          # The converters' native modules link libpython3.10.so.
+          LD_LIBRARY_PATH=$pythonLocation/lib python tests/qnn/make_fixtures.py build/qnn-fixtures
+          LD_LIBRARY_PATH=$QNN_SDK_ROOT/lib/x86_64-linux-clang build/bin/test-qnn build/qnn-fixtures
+
+      - name: Build (Android arm64)
+        run: |
+          export QNN_SDK_ROOT=$PWD/qairt/${QAIRT_VERSION}
+          cmake -S examples/android-bench -B build-android -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
+                -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-31
+          cmake --build build-android --target sd-bench sd-cli test-qnn
+
   windows-latest-cmake:
     needs: runner_names
     runs-on: ${{ needs.runner_names.outputs.windows_2022 }}
