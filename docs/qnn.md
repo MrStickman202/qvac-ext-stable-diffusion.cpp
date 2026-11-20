@@ -4,6 +4,8 @@ On Android phones with a Snapdragon 8 Gen 2 or newer (Galaxy S23, S24 and S25 se
 
 Each sidecar is a QNN *context binary* (`.bin`): the model compiled ahead of time for one Snapdragon SoC. The default target is the SM8750 (Snapdragon 8 Elite, Hexagon v79) in the Galaxy S25 / S25 Ultra; `--soc` in the export scripts picks another.
 
+To just try it on a Galaxy S25, install the app in [examples/android-app](../examples/android-app/README.md): it downloads the model files and runs SDXS on the NPU, with a CPU switch for comparison.
+
 ### Status
 
 | | Checked |

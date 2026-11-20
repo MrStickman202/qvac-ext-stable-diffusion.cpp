@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A chip outline with a four-point spark: image generation on the NPU. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:strokeColor="#FF7FB4FF"
+        android:strokeWidth="3"
+        android:fillColor="#00000000"
+        android:pathData="M38,34h32a4,4 0,0 1,4 4v32a4,4 0,0 1,-4 4h-32a4,4 0,0 1,-4 -4v-32a4,4 0,0 1,4 -4z" />
+    <path
+        android:strokeColor="#FF7FB4FF"
+        android:strokeWidth="3"
+        android:strokeLineCap="round"
+        android:pathData="M44,34v-6M54,34v-6M64,34v-6M44,80v-6M54,80v-6M64,80v-6M34,44h-6M34,54h-6M34,64h-6M80,44h-6M80,54h-6M80,64h-6" />
+    <path
+        android:fillColor="#FFFFD27F"
+        android:pathData="M54,40 C55.5,49 59,52.5 68,54 C59,55.5 55.5,59 54,68 C52.5,59 49,55.5 40,54 C49,52.5 52.5,49 54,40 Z" />
+</vector>
