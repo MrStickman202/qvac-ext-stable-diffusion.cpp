@@ -10,7 +10,8 @@ Each sidecar is a QNN *context binary* (`.bin`): the model compiled ahead of tim
 | --- | --- |
 | Runtime (`src/qnn_*.cpp`): loading, graph selection, fp32 / fp16 / 16-bit fixed-point I/O, batched CFG, error paths | `test-qnn` on the x86 HTP simulator, which computes what the NPU computes |
 | SDXS tiny decoder, exported with `convert_tae_decoder.py` for SM8750 | 62.2 dB PSNR against PyTorch fp32 on the HTP simulator |
-| Whole pipeline (`new_sd_ctx` / `generate_image`) with the QNN decoder: SDXS, 1 step | `test-qnn` with `SD_TEST_SDXS_DIR`, on the simulator |
+| Whole pipeline (`new_sd_ctx` / `generate_image`) with the QNN decoder: SDXS, 1 step | `test-qnn` with `SD_TEST_SDXS_DIR`, on the simulator: 62.9 dB against the ggml decoder |
+| SDXS with the UNet **and** the decoder on QNN (`sd-cli --qnn-unet --qnn-tae`, fp16 UNet for SM8750) | 43.0 dB PSNR against all-ggml (CPU) on the simulator, same seed and prompt; the images look the same |
 | Builds for Android arm64 (NDK r27) | CI |
 | Speed on a phone, and the UNet exports on a phone | **not measured yet**: run [examples/android-bench](../examples/android-bench/README.md) on a device |
 
@@ -58,7 +59,7 @@ python script/qnn/export_artifacts.py --out artifacts --dry-run                 
 | Model | Artifact | Used as |
 | --- | --- | --- |
 | SDXS-512-DreamShaper | `sdxs-f16.gguf` (sd-cli -M convert) | `-m` |
-| | `sdxs_unet_fp16.bin` | `--qnn-unet` |
+| | `sdxs_unet_fp16.bin` (636 MB) | `--qnn-unet` |
 | | `sdxs_tae_decoder.bin` (3.4 MB) | `--qnn-tae` |
 | SD 2.1-base | `sd21base-Q8_0.gguf` | `-m` |
 | | `sd21base_unet_w8a16.bin` (8-bit weights, 16-bit activations, batch 2) | `--qnn-unet` |
@@ -82,7 +83,7 @@ python script/qnn/convert_unet.py --unet sd21-base/unet --out sd21base_unet_w8a1
 
 Each `--sizes` entry becomes one fixed-shape graph named `unet_<W>x<H>_b<N>_<eps|vpred>`; the runtime picks the graph whose shapes match, and reads the prediction type from the name (so SD 2.x needs no `--prediction` with an exported UNet). Without `--share-weights` every graph carries its own copy of the weights. With it, HTP weight sharing keeps one copy, but the x86 simulator cannot load such binaries, so they have not been checked. The same SDXS size rules as for CoreML apply: SDXS is refused at sizes other than 512x512 unless `--allow-untrained-sizes` is given.
 
-`--check` runs the exported UNet once on the x86 HTP simulator against PyTorch fp32. The simulator is exact but slow: the 1.2M-parameter tiny decoder takes 12 minutes at 512x512 on a 2-core machine, so a full UNet takes hours.
+`--check` runs the exported UNet once on the x86 HTP simulator against PyTorch fp32. The simulator is exact but slow: on a 2-core machine one SDXS UNet call takes about 40 minutes and the tiny decoder 12 minutes at 512x512. The SDXS fp16 export itself takes about 80 s (ONNX export, conversion and HTP compile).
 
 #### Tiny decoder
 
