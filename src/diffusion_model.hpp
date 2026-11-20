@@ -9,9 +9,7 @@
 #include "wan.hpp"
 #include "z_image.hpp"
 
-#ifdef SD_USE_COREML
-#include "coreml_unet.h"
-#endif
+#include "sidecar.h"
 
 struct DiffusionParams {
     struct ggml_tensor* x                     = nullptr;
@@ -113,17 +111,16 @@ struct UNetModel : public DiffusionModel {
     }
 };
 
-#ifdef SD_USE_COREML
-// UNet offloaded to a CoreML model; holds no ggml weights.
-struct CoreMLUNetModel : public DiffusionModel {
-    std::unique_ptr<CoreMLUNet> coreml;
+// UNet offloaded to a sidecar model (CoreML or QNN, see sidecar.h); holds no ggml weights.
+struct SidecarUNetModel : public DiffusionModel {
+    std::unique_ptr<UNetSidecar> sidecar;
 
-    explicit CoreMLUNetModel(std::unique_ptr<CoreMLUNet> coreml)
-        : coreml(std::move(coreml)) {
+    explicit SidecarUNetModel(std::unique_ptr<UNetSidecar> sidecar)
+        : sidecar(std::move(sidecar)) {
     }
 
     std::string get_desc() override {
-        return coreml->get_desc();
+        return sidecar->get_desc();
     }
 
     void alloc_params_buffer() override {}
@@ -143,12 +140,12 @@ struct CoreMLUNetModel : public DiffusionModel {
         ggml_tensor* timesteps = diffusion_params.timesteps;
         ggml_tensor* context   = diffusion_params.context;
         if (diffusion_params.c_concat != nullptr || diffusion_params.y != nullptr || !diffusion_params.controls.empty()) {
-            LOG_ERROR("coreml unet: c_concat, y and controls are not supported");
+            LOG_ERROR("unet sidecar: c_concat, y and controls are not supported");
             return false;
         }
         for (ggml_tensor* t : {x, timesteps, context}) {
             if (t == nullptr || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->data == nullptr) {
-                LOG_ERROR("coreml unet: inputs must be contiguous float32 host tensors");
+                LOG_ERROR("unet sidecar: inputs must be contiguous float32 host tensors");
                 return false;
             }
         }
@@ -165,7 +162,7 @@ struct CoreMLUNetModel : public DiffusionModel {
         // ggml's [W, H, C, N] and [D, T, N] are row-major [N, C, H, W] and [N, T, D].
         const int64_t x_shape[4]   = {x->ne[3], x->ne[2], x->ne[1], x->ne[0]};
         const int64_t ctx_shape[3] = {context->ne[2] * context->ne[3], context->ne[1], context->ne[0]};
-        return coreml->predict((const float*)x->data,
+        return sidecar->predict((const float*)x->data,
                                x_shape,
                                (const float*)timesteps->data,
                                (const float*)context->data,
@@ -175,7 +172,7 @@ struct CoreMLUNetModel : public DiffusionModel {
 
     // True when the model takes CFG's conditional and unconditional passes as one batch of 2.
     bool takes_cfg_batch() {
-        return coreml->batch_size() == 2;
+        return sidecar->batch_size() == 2;
     }
 
     // Runs both CFG passes in one call: x and timesteps are shared, the contexts differ.
@@ -186,12 +183,12 @@ struct CoreMLUNetModel : public DiffusionModel {
                            ggml_tensor* out_cond,
                            ggml_tensor* out_uncond) {
         if (x->ne[3] != 1 || !ggml_are_same_shape(cond_context, uncond_context)) {
-            LOG_ERROR("coreml unet: batched CFG needs a batch-1 latent and contexts of equal length");
+            LOG_ERROR("unet sidecar: batched CFG needs a batch-1 latent and contexts of equal length");
             return false;
         }
         const int64_t x_shape[4]   = {1, x->ne[2], x->ne[1], x->ne[0]};
         const int64_t ctx_shape[3] = {1, cond_context->ne[1], cond_context->ne[0]};
-        return coreml->predict_cfg_batch((const float*)x->data,
+        return sidecar->predict_cfg_batch((const float*)x->data,
                                          x_shape,
                                          ((const float*)timesteps->data)[0],
                                          (const float*)cond_context->data,
@@ -201,7 +198,6 @@ struct CoreMLUNetModel : public DiffusionModel {
                                          (float*)out_uncond->data);
     }
 };
-#endif
 
 struct MMDiTModel : public DiffusionModel {
     MMDiTRunner mmdit;

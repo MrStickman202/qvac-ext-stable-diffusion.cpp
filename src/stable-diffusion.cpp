@@ -1,3 +1,5 @@
+#include <type_traits>
+
 #include "ggml_extend.hpp"
 
 #include "model.h"
@@ -14,7 +16,13 @@
 #include "diffusion_model.hpp"
 #ifdef SD_USE_COREML
 #include "coreml_tae.h"
+#include "coreml_unet.h"
 #endif
+#ifdef SD_USE_QNN
+#include "qnn_tae.h"
+#include "qnn_unet.h"
+#endif
+#include "sidecar.h"
 #include "easycache.hpp"
 #include "esrgan.hpp"
 #include "lora.hpp"
@@ -100,6 +108,56 @@ void suppress_pp(int step, int steps, float time, void* data) {
     return;
 }
 
+/*==================================================== Sidecars =====================================================*/
+
+// The UNet or tiny-decoder sidecar named in the context params: a CoreML model (coreml_*_path) or a
+// QNN context binary (qnn_*_path). Returns false on error, and leaves `out` empty when none is set.
+template <typename T>
+static bool load_sidecar(const char* what,
+                         const char* coreml_option,
+                         const char* coreml_path,
+                         const char* qnn_option,
+                         const char* qnn_path,
+                         const sd_ctx_params_t* params,
+                         std::unique_ptr<T>& out) {
+    coreml_path = SAFE_STR(coreml_path);
+    qnn_path    = SAFE_STR(qnn_path);
+    if (*coreml_path && *qnn_path) {
+        LOG_ERROR("%s and %s are both set; a %s runs on one of them", coreml_option, qnn_option, what);
+        return false;
+    }
+    if (!*coreml_path && !*qnn_path) {
+        return true;
+    }
+    const char* option = *coreml_path ? coreml_option : qnn_option;
+    if (params->circular_x || params->circular_y) {
+        LOG_ERROR("%s does not support circular padding: the %s keeps the padding it was exported with", option, what);
+        return false;
+    }
+    if (*coreml_path) {
+#ifdef SD_USE_COREML
+        if constexpr (std::is_same_v<T, UNetSidecar>) {
+            out = CoreMLUNet::load(coreml_path);
+        } else {
+            out = CoreMLTAEDecoder::load(coreml_path);
+        }
+#else
+        LOG_ERROR("%s is set, but this build has no CoreML support (SD_COREML=OFF)", option);
+#endif
+    } else {
+#ifdef SD_USE_QNN
+        if constexpr (std::is_same_v<T, UNetSidecar>) {
+            out = QnnUNet::load(qnn_path);
+        } else {
+            out = QnnTAEDecoder::load(qnn_path);
+        }
+#else
+        LOG_ERROR("%s is set, but this build has no QNN support (SD_QNN=OFF)", option);
+#endif
+    }
+    return out != nullptr;
+}
+
 /*=============================================== StableDiffusionGGML ================================================*/
 
 class StableDiffusionGGML {
@@ -128,12 +186,10 @@ public:
     std::shared_ptr<FrozenCLIPVisionEmbedder> clip_vision;  // for svd or wan2.1 i2v
     std::shared_ptr<DiffusionModel> diffusion_model;
     std::shared_ptr<DiffusionModel> high_noise_diffusion_model;
-    bool use_coreml_unet = false;
+    bool use_sidecar_unet = false;  // the UNet runs as a CoreML or QNN sidecar (SidecarUNetModel)
     std::shared_ptr<VAE> first_stage_model;
     std::shared_ptr<TinyAutoEncoder> tae_first_stage;
-#ifdef SD_USE_COREML
-    std::unique_ptr<CoreMLTAEDecoder> coreml_tae;  // replaces tae_first_stage for untiled decodes
-#endif
+    std::unique_ptr<TAEDecoderSidecar> tae_sidecar;  // replaces tae_first_stage for untiled decodes
     std::shared_ptr<ControlNet> control_net;
     std::shared_ptr<PhotoMakerIDEncoder> pmid_model;
     std::shared_ptr<LoraModel> pmid_lora;
@@ -584,22 +640,14 @@ public:
                                                                                            embbeding_map,
                                                                                            version);
                 }
-                if (strlen(SAFE_STR(sd_ctx_params->coreml_unet_path)) > 0) {
-#ifdef SD_USE_COREML
-                    if (sd_ctx_params->circular_x || sd_ctx_params->circular_y) {
-                        LOG_ERROR("coreml_unet_path does not support circular padding: the CoreML UNet keeps the padding it was exported with");
-                        return false;
-                    }
-                    auto coreml_unet = CoreMLUNet::load(sd_ctx_params->coreml_unet_path);
-                    if (!coreml_unet) {
-                        return false;
-                    }
-                    diffusion_model  = std::make_shared<CoreMLUNetModel>(std::move(coreml_unet));
-                    use_coreml_unet  = true;
-#else
-                    LOG_ERROR("coreml_unet_path is set, but this build has no CoreML support (SD_COREML=OFF)");
+                std::unique_ptr<UNetSidecar> unet_sidecar;
+                if (!load_sidecar("sidecar UNet", "coreml_unet_path", sd_ctx_params->coreml_unet_path,
+                                  "qnn_unet_path", sd_ctx_params->qnn_unet_path, sd_ctx_params, unet_sidecar)) {
                     return false;
-#endif
+                }
+                if (unet_sidecar) {
+                    diffusion_model  = std::make_shared<SidecarUNetModel>(std::move(unet_sidecar));
+                    use_sidecar_unet = true;
                 } else {
                     diffusion_model = std::make_shared<UNetModel>(backend,
                                                                   offload_params_to_cpu,
@@ -698,24 +746,18 @@ public:
                 }
             }
 
-            if (strlen(SAFE_STR(sd_ctx_params->coreml_tae_decoder_path)) > 0) {
-#ifdef SD_USE_COREML
+            if (strlen(SAFE_STR(sd_ctx_params->coreml_tae_decoder_path)) > 0 ||
+                strlen(SAFE_STR(sd_ctx_params->qnn_tae_decoder_path)) > 0) {
                 if (!std::dynamic_pointer_cast<TinyImageAutoEncoder>(tae_first_stage)) {
-                    LOG_ERROR("coreml_tae_decoder_path needs the image tiny autoencoder: SDXS, or --taesd with an SD/SDXL model");
+                    LOG_ERROR("%s needs the image tiny autoencoder: SDXS, or --taesd with an SD/SDXL model",
+                              strlen(SAFE_STR(sd_ctx_params->coreml_tae_decoder_path)) > 0 ? "coreml_tae_decoder_path"
+                                                                                           : "qnn_tae_decoder_path");
                     return false;
                 }
-                if (sd_ctx_params->circular_x || sd_ctx_params->circular_y) {
-                    LOG_ERROR("coreml_tae_decoder_path does not support circular padding: the CoreML decoder keeps the padding it was exported with");
+                if (!load_sidecar("sidecar decoder", "coreml_tae_decoder_path", sd_ctx_params->coreml_tae_decoder_path,
+                                  "qnn_tae_decoder_path", sd_ctx_params->qnn_tae_decoder_path, sd_ctx_params, tae_sidecar)) {
                     return false;
                 }
-                coreml_tae = CoreMLTAEDecoder::load(sd_ctx_params->coreml_tae_decoder_path);
-                if (!coreml_tae) {
-                    return false;
-                }
-#else
-                LOG_ERROR("coreml_tae_decoder_path is set, but this build has no CoreML support (SD_COREML=OFF)");
-                return false;
-#endif
             }
 
             if (strlen(SAFE_STR(sd_ctx_params->control_net_path)) > 0) {
@@ -832,7 +874,7 @@ public:
         if (use_pmid) {
             ignore_tensors.insert("pmid.unet.");
         }
-        if (use_coreml_unet) {
+        if (use_sidecar_unet) {
             ignore_tensors.insert("model.diffusion_model.");
         }
         ignore_tensors.insert("model.diffusion_model.__x0__");
@@ -941,21 +983,19 @@ public:
             prediction_t pred_type = sd_ctx_params->prediction;
 
             if (pred_type == PREDICTION_COUNT) {
-                if (sd_version_is_sd2(version) && use_coreml_unet) {
-#ifdef SD_USE_COREML
-                    // The probe below runs the UNet on an 8x8 latent, which a fixed-shape CoreML UNet cannot take.
-                    std::string recorded = std::dynamic_pointer_cast<CoreMLUNetModel>(diffusion_model)->coreml->prediction_type();
+                if (sd_version_is_sd2(version) && use_sidecar_unet) {
+                    // The probe below runs the UNet on an 8x8 latent, which a fixed-shape sidecar UNet cannot take.
+                    std::string recorded = std::dynamic_pointer_cast<SidecarUNetModel>(diffusion_model)->sidecar->prediction_type();
                     if (recorded == "v_prediction") {
                         pred_type = V_PRED;
                     } else if (recorded == "epsilon") {
                         pred_type = EPS_PRED;
                     } else {
-                        LOG_ERROR("the CoreML UNet does not record its prediction type; re-export it with "
+                        LOG_ERROR("the sidecar UNet does not record its prediction type; re-export it with "
                                   "convert_unet.py or pass --prediction");
                         return false;
                     }
-                    LOG_INFO("prediction type from the CoreML UNet: %s", recorded.c_str());
-#endif
+                    LOG_INFO("prediction type from the sidecar UNet: %s", recorded.c_str());
                 } else if (sd_version_is_sd2(version)) {
                     // check is_using_v_parameterization_for_sd2
                     if (is_using_v_parameterization_for_sd2(ctx, sd_version_is_inpaint(version))) {
@@ -1112,14 +1152,14 @@ public:
         return lora;
     }
 
-    // The CoreML UNet has no ggml weights for a LoRA to change, so a LoRA with UNet tensors is an error.
-    bool check_coreml_unet_lora(const std::shared_ptr<LoraModel>& lora) {
-        if (!use_coreml_unet) {
+    // A sidecar UNet has no ggml weights for a LoRA to change, so a LoRA with UNet tensors is an error.
+    bool check_sidecar_unet_lora(const std::shared_ptr<LoraModel>& lora) {
+        if (!use_sidecar_unet) {
             return true;
         }
         for (const auto& kv : lora->lora_tensors) {
             if (is_diffusion_model_name(kv.first)) {
-                LOG_ERROR("lora '%s' changes the UNet, which runs on CoreML (coreml_unet_path) and cannot take LoRAs",
+                LOG_ERROR("lora '%s' changes the UNet, which runs as a sidecar (coreml_unet_path or qnn_unet_path) and cannot take LoRAs",
                           lora->lora_id.c_str());
                 return false;
             }
@@ -1160,7 +1200,7 @@ public:
             if (!lora || lora->lora_tensors.empty()) {
                 continue;
             }
-            if (!check_coreml_unet_lora(lora)) {
+            if (!check_sidecar_unet_lora(lora)) {
                 return false;
             }
             lora->apply(tensors, version, n_threads);
@@ -1252,7 +1292,7 @@ public:
 
                 auto lora = load_lora_model_from_file(lora_name, multiplier, backend, lora_tensor_filter);
                 if (lora && !lora->lora_tensors.empty()) {
-                    if (!check_coreml_unet_lora(lora)) {
+                    if (!check_sidecar_unet_lora(lora)) {
                         return false;
                     }
                     lora->preprocess_lora_tensors(tensors);
@@ -2156,25 +2196,23 @@ public:
                 active_condition          = &id_cond;
             }
 
-            // A CoreML UNet exported for batch 2 (Apple's ml-stable-diffusion) runs both CFG passes in one call.
-            bool cfg_batched = false;
-#ifdef SD_USE_COREML
-            auto coreml_unet = std::dynamic_pointer_cast<CoreMLUNetModel>(work_diffusion_model);
-            if (coreml_unet && coreml_unet->takes_cfg_batch()) {
+            // A sidecar UNet exported for batch 2 (such as Apple's ml-stable-diffusion) runs both CFG passes in one call.
+            bool cfg_batched  = false;
+            auto sidecar_unet = std::dynamic_pointer_cast<SidecarUNetModel>(work_diffusion_model);
+            if (sidecar_unet && sidecar_unet->takes_cfg_batch()) {
                 if (!has_unconditioned || has_img_cond || has_skiplayer || !controls.empty() || easycache_enabled ||
                     ucache_enabled || cachedit_enabled) {
-                    LOG_ERROR("this CoreML UNet runs CFG's two passes as one batch of 2: use cfg-scale > 1, "
+                    LOG_ERROR("this sidecar UNet runs CFG's two passes as one batch of 2: use cfg-scale > 1, "
                               "without ControlNet, image CFG, skip layers or step caching");
                     return nullptr;
                 }
-                if (!coreml_unet->compute_cfg_batch(noised_input, timesteps, active_condition->c_crossattn,
-                                                    uncond.c_crossattn, out_cond, out_uncond)) {
+                if (!sidecar_unet->compute_cfg_batch(noised_input, timesteps, active_condition->c_crossattn,
+                                                     uncond.c_crossattn, out_cond, out_uncond)) {
                     LOG_ERROR("diffusion model compute failed");
                     return nullptr;
                 }
                 cfg_batched = true;
             }
-#endif
 
             bool skip_model = cfg_batched || cache_before_condition(active_condition, *active_output);
             if (!skip_model) {
@@ -2827,15 +2865,12 @@ public:
                 sd_tiling(x, result, vae_scale_factor, 64, 0.5f, circular_x, circular_y, on_tiling);
             } else {
                 bool decoded = false;
-#ifdef SD_USE_COREML
-                if (coreml_tae && x->type == GGML_TYPE_F32 && ggml_is_contiguous(x)) {
+                if (tae_sidecar && x->type == GGML_TYPE_F32 && ggml_is_contiguous(x)) {
                     // ggml's [w, h, C, N] latent and [W, H, 3, N] image are row-major [N, C, h, w] and [N, 3, H, W].
                     const int64_t latent_shape[4] = {x->ne[3], x->ne[2], x->ne[1], x->ne[0]};
                     const int64_t image_shape[4]  = {result->ne[3], result->ne[2], result->ne[1], result->ne[0]};
-                    decoded = coreml_tae->decode((const float*)x->data, latent_shape, (float*)result->data, image_shape);
-                } else
-#endif
-                {
+                    decoded = tae_sidecar->decode((const float*)x->data, latent_shape, (float*)result->data, image_shape);
+                } else {
                     decoded = tae_first_stage->compute(n_threads, x, true, &result);
                 }
                 if (!decoded) {
