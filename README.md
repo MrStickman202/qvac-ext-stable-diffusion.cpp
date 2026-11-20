@@ -127,6 +127,7 @@ API and command-line option may change frequently.***
 
 If you want to improve performance or reduce VRAM/RAM usage, please refer to [performance guide](./docs/performance.md).
 On Apple devices, the UNet of SD 1.x/2.x models can run on the Neural Engine: see [CoreML sidecar](./docs/coreml.md).
+On Snapdragon Android phones (Galaxy S23 and newer) it can run on the Hexagon NPU: see [QNN sidecar](./docs/qnn.md).
 
 ## More Guides
 
