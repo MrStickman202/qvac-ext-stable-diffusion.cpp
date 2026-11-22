@@ -62,36 +62,44 @@ object Models {
 /**
  * Downloads the model files with the system DownloadManager, which keeps going in the background, survives the app
  * being closed and resumes after network drops. Download ids are kept in shared preferences so the app picks up
- * running downloads when it is opened again. Multi-part files are joined when their parts are done, and every
- * downloaded file is checked against its SHA-256.
+ * running downloads when it is opened again.
+ *
+ * Every download goes to a temporary "<file>.dl<part>" name. DownloadManager reserves a file's full size on disk as
+ * soon as a download starts, so a file's size says nothing about whether it is finished; only a download that
+ * DownloadManager reports as successful is moved (or, for multi-part files, joined) to its final name, and every
+ * final file is checked against its SHA-256 once.
  */
 class ModelDownloader(private val context: Context) {
     private val dm = context.getSystemService(DownloadManager::class.java)
-    private val prefs = context.getSharedPreferences("downloads", Context.MODE_PRIVATE)
+    // "downloads2": version 0.1 kept ids under "downloads" and wrote straight to the final names. Its files are
+    // left alone; finish() checks any that are the right size and deletes the ones that do not match.
+    private val prefs = context.getSharedPreferences("downloads2", Context.MODE_PRIVATE)
 
     data class Progress(val done: Long, val total: Long, val running: Boolean, val failed: String?)
 
-    private fun partFile(m: ModelFile, i: Int) =
-        if (m.urls.size == 1) Models.file(context, m) else File(Models.dir(context), "${m.path}.part%03d".format(i))
+    private fun tempFile(m: ModelFile, i: Int) = File(Models.dir(context), "${m.path}.dl$i")
 
-    private fun partPath(m: ModelFile, i: Int) = partFile(m, i).relativeTo(Models.dir(context)).path
+    private fun tempPath(m: ModelFile, i: Int) = tempFile(m, i).relativeTo(Models.dir(context)).path
 
     private fun key(m: ModelFile, i: Int) = "${m.path}#$i"
+
+    private fun expectedBytes(m: ModelFile, i: Int): Long =
+        if (m.urls.size == 1) m.bytes else minOf(PART_BYTES, m.bytes - i * PART_BYTES)
 
     fun start() {
         for (m in Models.missing(context)) {
             for ((i, url) in m.urls.withIndex()) {
                 val id = prefs.getLong(key(m, i), -1L)
                 val status = if (id >= 0) status(id) else -1
-                if (status in ACTIVE || status == DownloadManager.STATUS_SUCCESSFUL && partFile(m, i).exists()) {
+                if (status in ACTIVE || status == DownloadManager.STATUS_SUCCESSFUL && tempFile(m, i).exists()) {
                     continue
                 }
                 if (id >= 0) dm.remove(id)
-                partFile(m, i).apply { parentFile?.mkdirs(); delete() }
+                tempFile(m, i).apply { parentFile?.mkdirs(); delete() }
                 val request = DownloadManager.Request(Uri.parse(url))
                     .setTitle("SD NPU: ${File(m.path).name}" + if (m.urls.size > 1) " (${i + 1}/${m.urls.size})" else "")
                     .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)
-                    .setDestinationInExternalFilesDir(context, "models", partPath(m, i))
+                    .setDestinationInExternalFilesDir(context, "models", tempPath(m, i))
                     .setAllowedOverMetered(true)
                 prefs.edit().putLong(key(m, i), dm.enqueue(request)).apply()
             }
@@ -102,11 +110,10 @@ class ModelDownloader(private val context: Context) {
         for (m in Models.all) {
             for (i in m.urls.indices) {
                 val id = prefs.getLong(key(m, i), -1L)
-                if (id >= 0) dm.remove(id)
+                if (id >= 0) dm.remove(id)  // also deletes the partial file
                 prefs.edit().remove(key(m, i)).apply()
-                if (m.urls.size > 1) partFile(m, i).delete()
+                tempFile(m, i).delete()
             }
-            if (!Models.isPresent(context, m)) Models.file(context, m).delete()
         }
     }
 
@@ -125,6 +132,7 @@ class ModelDownloader(private val context: Context) {
                 dm.query(DownloadManager.Query().setFilterById(id)).use { c ->
                     if (!c.moveToFirst()) return@use
                     val status = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+                    // Bytes actually received, not the size of the (pre-allocated) file.
                     done += c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)).coerceAtLeast(0)
                     when (status) {
                         DownloadManager.STATUS_FAILED -> failed = "${File(m.path).name}: download failed (reason " +
@@ -139,25 +147,40 @@ class ModelDownloader(private val context: Context) {
     }
 
     /**
-     * Joins finished multi-part files and checks every newly completed file's SHA-256. Blocking: call it on a
-     * background thread once [progress] reports nothing running. Returns an error message, or null when all is well.
+     * Moves or joins downloads that DownloadManager reports as finished to their final names, and checks the SHA-256
+     * of every final file not checked yet (including files copied over USB). Blocking: call it on a background thread.
+     * Returns an error message, or null when all is well.
      */
     fun finish(): String? {
+        // Version 0.1 downloaded parts as "<file>.partNNN"; they are not used any more.
+        Models.dir(context).listFiles()?.filter { Regex(""".*\.part\d{3}$""").matches(it.name) }?.forEach { it.delete() }
         for (m in Models.all) {
-            if (Models.isPresent(context, m) && prefs.getBoolean("verified:${m.path}", false)) continue
-            if (m.urls.size > 1 && !Models.isPresent(context, m)) {
-                val parts = m.urls.indices.map { partFile(m, it) }
-                if (parts.any { !it.exists() }) continue  // still missing parts; not an error yet
+            if (!Models.isPresent(context, m)) {
+                val ids = m.urls.indices.map { prefs.getLong(key(m, it), -1L) }
+                val parts = m.urls.indices.map { tempFile(m, it) }
+                val complete = ids.all { it >= 0 && status(it) == DownloadManager.STATUS_SUCCESSFUL } &&
+                    parts.withIndex().all { (i, f) -> f.length() == expectedBytes(m, i) }
+                if (!complete) continue
                 val out = Models.file(context, m)
                 out.parentFile?.mkdirs()
-                out.outputStream().use { o -> parts.forEach { p -> p.inputStream().use { it.copyTo(o, 1 shl 20) } } }
-                parts.forEach { it.delete() }
+                out.delete()
+                if (parts.size == 1) {
+                    if (!parts[0].renameTo(out)) return "Could not move ${File(m.path).name} into place."
+                } else {
+                    val tmp = File(out.path + ".joining")
+                    tmp.outputStream().use { o -> parts.forEach { p -> p.inputStream().use { it.copyTo(o, 1 shl 20) } } }
+                    if (!tmp.renameTo(out)) return "Could not move ${File(m.path).name} into place."
+                    parts.forEach { it.delete() }
+                }
+                prefs.edit().remove("verified:${m.path}").apply()
+                // The downloads' records point at files that no longer exist; drop them so they are not reused.
+                ids.forEach { dm.remove(it) }
+                m.urls.indices.forEach { prefs.edit().remove(key(m, it)).apply() }
             }
-            if (!Models.isPresent(context, m)) continue
+            if (!Models.isPresent(context, m) || prefs.getBoolean("verified:${m.path}", false)) continue
             if (sha256(Models.file(context, m)) != m.sha256) {
                 Models.file(context, m).delete()
-                m.urls.indices.forEach { prefs.edit().remove(key(m, it)).apply() }
-                return "${File(m.path).name} was corrupted in transit and has been deleted. Tap Download to fetch it again."
+                return "${File(m.path).name} did not match its checksum and has been deleted. Tap Download to fetch it again."
             }
             prefs.edit().putBoolean("verified:${m.path}", true).apply()
         }
@@ -183,6 +206,8 @@ class ModelDownloader(private val context: Context) {
         }
 
     companion object {
+        /** Size of every part but the last of a multi-part file (see the sdnpu-models branch). */
+        const val PART_BYTES = 95_000_000L
         private val ACTIVE = listOf(DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PENDING, DownloadManager.STATUS_PAUSED)
     }
 }
